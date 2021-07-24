@@ -1,0 +1,4 @@
+2. Processed Datasets/**
+3. Models/**
+*.vscode
+*__pycache__*
