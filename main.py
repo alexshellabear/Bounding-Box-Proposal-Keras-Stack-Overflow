@@ -16,9 +16,8 @@ from tensorflow.python.keras.losses import mean_squared_error
 
     Research 
         1) shubham0204 for IOU regression componenet
+        2) IOU regression loss https://github.com/Balupurohit23/IOU-for-bounding-box-regression-in-Keras/blob/master/iou_loss.py
 """
-
-
 
 """ ------------------------------------------------------ Dataset ----------------------------------------------------------- """
 class generate_dataset():
@@ -29,7 +28,6 @@ class generate_dataset():
         self.img_channels = dataset_config["ImageChannels"]
         self.number_of_images = dataset_config["DatasetSize"]
          
-
         self.dataset = self.create_dataset()
 
     def create_dataset(self):
@@ -37,15 +35,95 @@ class generate_dataset():
         """Format of dictionary {"Image":...,"GroundTruthBox":...,"ImageColour":...}"""
         return [self.create_random_colour_bbox_img() for v in range(self.number_of_images)]
 
-    def generate_model_compatible_dataset(self, feature_map_shape):
+    def generate_model_compatible_dataset(self, settings):
         """Generate dataset that is compatable with model"""
-        """TODO Have user input with settings dictionary"""
+        """   CV2 input image (numpy uint8) (224,224)
+              v
+              Pre-processed input image (numpy float) (224,224)
+              v
+              Feature map after going through backbone CNN (7,7,512)
+              v
+              Region proposal output
+        """
+        """Assumption 1: There is only one size of image that is passed to the CNN (224,224)"""
+        
+        pre_processed_input_image_shape = pre_process_image_for_vgg(self.dataset[0]["HumanReadable"]["Image"],settings["ModelInputSize"]).shape
+        feature_to_input, input_to_feature = get_conversions_between_input_and_feature(pre_processed_input_image_shape,settings["FeatureMapShape_Num_W_H_C"])
+        anchor_boxes_input_coordinates_2d = get_input_coordinates_of_anchor_points(settings["FeatureMapShape_Num_W_H_C"],feature_to_input)
 
-        print('got here')
+        # Update dataset with ModelCompatible item
+        [ row.update({"ModelCompatible" : { 
+            "Input" : settings["BackboneClassifier"].predict(pre_process_image_for_vgg(row["HumanReadable"]["Image"],settings["ModelInputSize"]))
+            ,"Output" : generate_dataset.create_model_compatible_ground_truth(
+                anchor_boxes_input_coordinates_2d
+                ,row["HumanReadable"]["GroundTruthBox"]
+                ,settings["OutputShape"][0]
+            )
+        }
+        }) for row in self.dataset]
+
+    def get_machine_formatted_dataset(self):
+        """produces a dataset in a format which ML can train on split into x and y data"""
+        x_data = np.array([row["ModelCompatible"]["Input"][0] for row in self.dataset])
+        y_data = [
+            np.array([row["ModelCompatible"]["Output"][0][0] for row in self.dataset])
+            ,np.array([row["ModelCompatible"]["Output"][1][0] for row in self.dataset])
+        ]
+        return x_data, y_data
+
+    @staticmethod # can be called without initialising custom_model. Assumption means this function is associated to the dataset
+    def create_regression_model_compatible_ground_truth(anchor_boxes_input_coordinates_2d,gt_bbox):
+        """Creates ground truth for regression component of RPN in input space coordinates"""
+        """Assumption 1: Dataset only contains 1 object per frame"""
+        delta_anchor_boxes_human_readable =  [[
+            {
+                "delta_x_c" : gt_bbox["xywh"]["x_c"] - anchor_bbox["xywh"]["x_c"]
+                ,"delta_y_c" : gt_bbox["xywh"]["y_c"] - anchor_bbox["xywh"]["y_c"]
+                ,"delta_w" : gt_bbox["xywh"]["w"] - anchor_bbox["xywh"]["w"]
+                ,"delta_h" : gt_bbox["xywh"]["h"] - anchor_bbox["xywh"]["h"]
+                }
+            for anchor_bbox in list_of_anchor_boxes] for list_of_anchor_boxes in anchor_boxes_input_coordinates_2d]
+
+        delta_regression_boxes_ground_truth = np.array([[[
+            [
+                float(deltas["delta_x_c"])
+                ,float(deltas["delta_y_c"])
+                ,float(deltas["delta_w"])
+                ,float(deltas["delta_h"])
+            ]
+            for deltas in list_of_deltas] for list_of_deltas in delta_anchor_boxes_human_readable]])
+        return delta_regression_boxes_ground_truth 
+
+    @staticmethod # can be called without initialising custom_model. Assumption means this function is associated to the dataset
+    def create_classifier_model_compatible_ground_truth(anchor_boxes_input_coordinates_2d,ground_truth_bbox,output_shape):
+        """Creates an array representing ground truth for selecting the anchor box with highest IOU"""
+        """Assumption 1: Dataset only contains 1 object per frame"""
+        iou_of_anchor_boxes_with_gt =  [[
+            get_iou_from_bboxes(anchor_box,ground_truth_bbox)
+            for anchor_box in list_of_anchor_boxes] for list_of_anchor_boxes in anchor_boxes_input_coordinates_2d]
+
+        iou_of_anchor_boxes_with_gt_array = np.array(iou_of_anchor_boxes_with_gt)
+        height_index = int(max(iou_of_anchor_boxes_with_gt_array.argmax(axis=0)))
+        width_index = int(max(iou_of_anchor_boxes_with_gt_array.argmax(axis=1)))
+        bbox_channel_index = 0 # There is no scale, aspect ratio adjustments. Hence channels will always be 0
+
+        region_proposal_classifier_ground_truth = np.zeros(output_shape,np.float64)
+        region_proposal_classifier_ground_truth[0][height_index][width_index][bbox_channel_index] = 1.0
+
+        return region_proposal_classifier_ground_truth
 
     @staticmethod # can be called without initialising custom_model
-    def create_model_compatible_ground_truth():
-        """Creates ground truth for program"""
+    def create_model_compatible_ground_truth(anchor_boxes_input_coordinates_2d,gt_box,classifier_outputshape):
+        """Creates ground truth aka the true output for the RPN"""
+        classifier_ground_truth = generate_dataset.create_classifier_model_compatible_ground_truth(
+            anchor_boxes_input_coordinates_2d
+            ,gt_box
+            ,classifier_outputshape)
+
+        regression_ground_truth = generate_dataset.create_regression_model_compatible_ground_truth(
+            anchor_boxes_input_coordinates_2d
+            ,gt_box)
+        return [classifier_ground_truth, regression_ground_truth] 
 
     def create_random_colour_bbox_img(self):
         """Creates a box of random colour and random points and returns an cv2 image"""
@@ -135,17 +213,15 @@ class generate_custom_model():
         return model
 
     def get_feature_map_shape(self,input_image):
-        """Provides the input shape of the RPN model in the format (height,width,channels)"""
+        """Provides the input shape of the RPN model in the format (number,height,width,channels)"""
         pre_processed_img = pre_process_image_for_vgg(input_image,self.backbone_classifier_input_shape)
-        #pre_processed_img = pre_process_image_for_vgg(img,(224,224))
-        #feature_map_output_from_backbone_classifier = custom_model.backbone_classifier.predict(pre_processed_img)
         feature_map_output_from_backbone_classifier = self.backbone_classifier.predict(pre_processed_img)
-        feature_map_shape_h_w_c = feature_map_output_from_backbone_classifier.shape[0]
-        return feature_map_shape_h_w_c
+        feature_map_shape_num_h_w_c = feature_map_output_from_backbone_classifier.shape
+        return feature_map_shape_num_h_w_c
 
     def get_model_output_shape(self,input_image):
         """Gets the model output shape"""
-        """Accounts for RPN which provides output as list"""
+        """Accounts for RPN which provides outputs as list"""
         pre_processed_img = pre_process_image_for_vgg(input_image,self.backbone_classifier_input_shape)
         feature_map_output_from_backbone_classifier = self.backbone_classifier.predict(pre_processed_img)
         
@@ -300,34 +376,84 @@ def get_input_coordinates_of_anchor_points(feature_map_shape,feature_to_input):
     # For the feature map (x,y) determine the anchors on the input image (x,y) as array 
     feature_to_input_coords_x  = [int(x_feature*feature_to_input["x_scale"]+feature_to_input["x_offset"]) for x_feature in range(features_width)]
     feature_to_input_coords_y  = [int(y_feature*feature_to_input["y_scale"]+feature_to_input["y_offset"]) for y_feature in range(features_height)]
-    coordinate_of_anchor_points_2d = [[{"x":x_coord,"y":y_coord} for x_coord in feature_to_input_coords_x] for y_coord in feature_to_input_coords_y]
+    coordinate_of_anchor_points_2d = [[{
+        "p1p2" : {
+            "x1" : round(x_coord - feature_to_input["x_scale"]/2)
+            ,"y1" : round(y_coord - feature_to_input["y_scale"]/2)
+            ,"x2" : round(x_coord + feature_to_input["x_scale"]/2)
+            ,"y2" : round(y_coord + feature_to_input["y_scale"]/2)
+        }
+        ,"xywh" : {
+            "x_c" : round(x_coord)
+            ,"y_c" : round(y_coord)
+            ,"w" : round(feature_to_input["x_scale"])
+            ,"h" : round(feature_to_input["y_scale"])
+        }
+        } for x_coord in feature_to_input_coords_x] for y_coord in feature_to_input_coords_y]
 
     return coordinate_of_anchor_points_2d
 
-def get_input_coordinates_of_all_anchor_boxes(coordinate_of_anchor_points_2d,feature_to_input,scale,aspect_ratio):
-    """Gets the bounding boxes of all anchor boxes and produces a 3d array height, width, boxes with dict {x1,y1,x2,y2}""" 
-    width = feature_to_input["x_scale"]
-    height = feature_to_input["y_scale"]
-    return [[get_coords_for_anchor_box_given_point(coord,width,height,scale,aspect_ratio) for coord in y_coords] for y_coords in coordinate_of_anchor_points_2d]
+def get_iou_from_bboxes(bbox_1,bbox_2):
+    """Finds the Intersection Over Union (IOU) of two bounding boxes"""
+    """Taken from https://stackoverflow.com/questions/25349178/calculating-percentage-of-bounding-box-overlap-for-image-detector-evaluation """
+    # determine the coordinates of the intersection rectangle
+    x_left = max(bbox_1["p1p2"]['x1'], bbox_2["p1p2"]['x1'])
+    y_top = max(bbox_1["p1p2"]['y1'], bbox_2["p1p2"]['y1'])
+    x_right = min(bbox_1["p1p2"]['x2'], bbox_2["p1p2"]['x2'])
+    y_bottom = min(bbox_1["p1p2"]['y2'], bbox_2["p1p2"]['y2'])
 
-def get_coords_for_anchor_box_given_point(coord,width,height,scale,aspect_ratio):
-    """Given anchor point {"x":x,"y":y} coord find the anchor boxes for that in the format {x1,y1,x2,y2} & {x_c,y_c,w,h}"""
-    anchor_box_coords_input_space = [{
-        "xywh" : {
-            "x_c":coord["x"]
-            ,"y_c":coord["y"]
-            ,"w":int(round(width*s/ar))
-            ,"h":int(round(height*ar*s))
-        }
-        ,"p1p2" : {
-            "x1":coord["x"] - int(round(width*s/ar/2))
-            ,"y1":coord["y"] - int(round(height*ar*s/2))
-            ,"x2":coord["x"] + int(round(width*s/ar/2))
-            ,"y2":coord["y"] + int(round(height*ar*s/2))
-        }
-        } for ar in aspect_ratio for s in scale]
+    if x_right < x_left or y_bottom < y_top:
+        return 0.0
 
-    return anchor_box_coords_input_space
+    # The intersection of two axis-aligned bounding boxes is always an
+    # axis-aligned bounding box
+    intersection_area = (x_right - x_left) * (y_bottom - y_top)
+
+    # compute the area of both AABBs
+    bbox_1_area = (bbox_1["p1p2"]['x2'] - bbox_1["p1p2"]['x1']) * (bbox_1["p1p2"]['y2'] - bbox_1["p1p2"]['y1'])
+    bbox_2_area = (bbox_2["p1p2"]['x2'] - bbox_2["p1p2"]['x1']) * (bbox_2["p1p2"]['y2'] - bbox_2["p1p2"]['y1'])
+
+    # compute the intersection over union by taking the intersection
+    # area and dividing it by the sum of prediction + ground-truth
+    # areas - the interesection area
+    iou = intersection_area / float(bbox_1_area + bbox_2_area - intersection_area)
+    return iou
+
+def iou_loss(y_true, y_pred):
+    """IOU loss function for """
+    # iou loss for bounding box prediction
+    # input must be as [x1, y1, x2, y2]
+    
+    # AOG = Area of Groundtruth box
+    AoG = K.abs(K.transpose(y_true)[2] - K.transpose(y_true)[0] + 1) * K.abs(K.transpose(y_true)[3] - K.transpose(y_true)[1] + 1)
+    
+    # AOP = Area of Predicted box
+    AoP = K.abs(K.transpose(y_pred)[2] - K.transpose(y_pred)[0] + 1) * K.abs(K.transpose(y_pred)[3] - K.transpose(y_pred)[1] + 1)
+
+    # overlaps are the co-ordinates of intersection box
+    overlap_0 = K.maximum(K.transpose(y_true)[0], K.transpose(y_pred)[0])
+    overlap_1 = K.maximum(K.transpose(y_true)[1], K.transpose(y_pred)[1])
+    overlap_2 = K.minimum(K.transpose(y_true)[2], K.transpose(y_pred)[2])
+    overlap_3 = K.minimum(K.transpose(y_true)[3], K.transpose(y_pred)[3])
+
+    # intersection area
+    intersection = (overlap_2 - overlap_0 + 1) * (overlap_3 - overlap_1 + 1)
+
+    # area of union of both boxes
+    union = AoG + AoP - intersection
+    
+    # iou calculation
+    iou = intersection / union
+
+    # bounding values of iou to (0,1)
+    iou = K.clip(iou, 0.0 + K.epsilon(), 1.0 - K.epsilon())
+
+    # loss for the iou value
+    iou_loss = -K.log(iou)
+
+    return iou_loss
+
+
 """ -------------------------------------------------------- CONFIG ----------------------------------------------------------- """
 config = {
     "Dataset" : 
@@ -335,27 +461,31 @@ config = {
         "ImageWidth" : 224
         ,"ImageHeight" : 224
         ,"ImageChannels" : 3
-        ,"DatasetSize" : 10000
+        ,"DatasetSize" : 50
     }
     ,"Model" : {
         "ModelInputSize" : (224,224)
+        # More settings added later in code
     }
 }
 
 if __name__ == "__main__":
-    print("starting...")
+    # Select classifier
     config["Model"]["BackboneClassifier"] = applications.VGG16(include_top=False,weights='imagenet')
 
-    
+    # Create dataset of random boxes in human readable format
     dataset = generate_dataset(config["Dataset"])
     
+    # Create custom model and add to settings
     custom_model = generate_custom_model(config["Model"])
-    feature_map_shape = custom_model.get_feature_map_shape(dataset.get_random_image())
+    config["Model"]["FeatureMapShape_Num_W_H_C"] = custom_model.get_feature_map_shape(dataset.get_random_image())
+    config["Model"]["OutputShape"] = custom_model.get_model_output_shape(dataset.get_random_image())
 
-    dataset.generate_model_compatible_dataset(feature_map_shape)
+    # Create machine dataset, this takes a while because it has to run through the CNN
+    dataset.generate_model_compatible_dataset(config["Model"])
 
-    classifier_prediction_ready_image = pre_process_image_for_vgg(dataset.dataset[0]["Image"],(224,224))
-    feature_map = custom_model.backbone_classifier.predict(classifier_prediction_ready_image)
-    predicted_output = custom_model.model.predict(feature_map)
+    # Split dataset & train model
+    x_data, y_data = dataset.get_machine_formatted_dataset()
+    history = custom_model.model.fit(x=x_data,y=y_data, batch_size=8, shuffle=True, epochs=4, verbose=1,validation_split=0.1)
 
-    print("finishing...")
+    predicted_output = custom_model.model.predict(dataset.dataset[0]["ModelCompatible"]["Input"])
