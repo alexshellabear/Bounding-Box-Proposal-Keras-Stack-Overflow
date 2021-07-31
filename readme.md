@@ -1,6 +1,8 @@
 # Goal #
 Draw a bounding box around an object of interest. Ideal architecture is using Faster-RCNN from stratch to understand how it works.
 
+my email address is alexshellabear@gmail.com, what is yours?
+
 ## Deeper Explanation of Goal ##
 I want to be able to draw bounding boxes around objects of interest. To simplify the problem I am trying to understand the region proposal network (RPN) component of Faster-RCNN. The below architecture is what I hope to implement
 - Backbone CNN is VGG16, which will produce the feature map of shape (:,7,7,512)
