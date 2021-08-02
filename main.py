@@ -1,6 +1,7 @@
 import cv2
 import numpy as np
 import random
+import math
 
 from keras import layers
 from keras import Model
@@ -17,6 +18,8 @@ from tensorflow.python.keras.losses import mean_squared_error
     Research 
         1) shubham0204 for IOU regression componenet
         2) IOU regression loss https://github.com/Balupurohit23/IOU-for-bounding-box-regression-in-Keras/blob/master/iou_loss.py
+        3) When writing a custom loss function with additional parameters you'll need this https://medium.com/@Bloomore/how-to-write-a-custom-loss-function-with-additional-arguments-in-keras-5f193929f7a0
+        4) The article I was looking for
 """
 
 """ ------------------------------------------------------ Dataset ----------------------------------------------------------- """
@@ -73,9 +76,9 @@ class generate_dataset():
 
     @staticmethod # can be called without initialising custom_model. Assumption means this function is associated to the dataset
     def create_regression_model_compatible_ground_truth(anchor_boxes_input_coordinates_2d,gt_bbox):
-        """Creates ground truth for regression component of RPN in input space coordinates"""
+        """Creates ground truth for regression component of RPN in parameterised coordinate space"""
         """Assumption 1: Dataset only contains 1 object per frame"""
-        delta_anchor_boxes_human_readable =  [[
+        delta_anchor_boxes_human_readable =  [[ # Used for readability
             {
                 "delta_x_c" : gt_bbox["xywh"]["x_c"] - anchor_bbox["xywh"]["x_c"]
                 ,"delta_y_c" : gt_bbox["xywh"]["y_c"] - anchor_bbox["xywh"]["y_c"]
@@ -84,14 +87,23 @@ class generate_dataset():
                 }
             for anchor_bbox in list_of_anchor_boxes] for list_of_anchor_boxes in anchor_boxes_input_coordinates_2d]
 
+        delta_parametarised_anchor_boxes_human_readable =  [[
+            {
+                "parm_delta_t_x" : parameterize_x_or_y_centre(gt_bbox["xywh"]["x_c"], anchor_bbox["xywh"]["x_c"], anchor_bbox["xywh"]["w"]) 
+                ,"parm_delta_t_y" : parameterize_x_or_y_centre(gt_bbox["xywh"]["y_c"], anchor_bbox["xywh"]["y_c"], anchor_bbox["xywh"]["h"])
+                ,"parm_delta_t_w" : parameterize_width_or_height(gt_bbox["xywh"]["w"], anchor_bbox["xywh"]["w"])
+                ,"parm_delta_t_h" : parameterize_width_or_height(gt_bbox["xywh"]["h"], anchor_bbox["xywh"]["h"])
+                }
+            for anchor_bbox in list_of_anchor_boxes] for list_of_anchor_boxes in anchor_boxes_input_coordinates_2d]
+
         delta_regression_boxes_ground_truth = np.array([[[
             [
-                float(deltas["delta_x_c"])
-                ,float(deltas["delta_y_c"])
-                ,float(deltas["delta_w"])
-                ,float(deltas["delta_h"])
+                float(deltas["parm_delta_t_x"])
+                ,float(deltas["parm_delta_t_y"])
+                ,float(deltas["parm_delta_t_w"])
+                ,float(deltas["parm_delta_t_h"])
             ]
-            for deltas in list_of_deltas] for list_of_deltas in delta_anchor_boxes_human_readable]])
+            for deltas in list_of_parm_deltas] for list_of_parm_deltas in delta_parametarised_anchor_boxes_human_readable]])
         return delta_regression_boxes_ground_truth 
 
     @staticmethod # can be called without initialising custom_model. Assumption means this function is associated to the dataset
@@ -147,10 +159,11 @@ class generate_dataset():
 
     def generate_x1y1_x2y2(self):
         """Creates random coordinates of a bounding box in two forms, {(x1,y1),(x2,y2)} & also in x_centre, y_centre, width & height"""
-        x1 = random.randint(0,self.img_w)
-        y1 = random.randint(0,self.img_h)
-        x2 = random.randint(x1,self.img_w)
-        y2 = random.randint(y1,self.img_h)
+        """Note 1: Cannot have a width or height of 0 account for this"""
+        x1 = random.randint(0,self.img_w-1)
+        y1 = random.randint(0,self.img_h-1)
+        x2 = random.randint(x1+1,self.img_w)
+        y2 = random.randint(y1+1,self.img_h)
 
         ground_truth_bounding_box = {
             "p1p2" : {
@@ -232,58 +245,78 @@ class generate_custom_model():
             model_output_shapes = model_output.shape
         return model_output_shapes
 
-    def calculate_iou(target_boxes,predicted_boxes):
-        """Calculates IOU for loss function"""
-        """TODO confirm Assumes that input matrix is in the form [[],[],[],[]]"""
-        # TODO give credit to shubham0204 github repo
-        # Get the area of intersection 
-        top_left_x_intersect_matrix = K.maximum(target_boxes[...,0],predicted_boxes[...,0])
-        top_left_y_intersect_matrix = K.maximum(target_boxes[...,1],predicted_boxes[...,1])
-        bottom_right_x_intersect_matrix = K.minimum(target_boxes[...,2],predicted_boxes[...,2])
-        bottom_right_y_intersect_matrix = K.minimum(target_boxes[...,3],predicted_boxes[...,3])
+    def predict_object(self,image_224_224,objectiveness_threshold=0.4):
+        """Provides the bounding boxes for a given colour image of 224x224 with an objectivness_threshold that is default to 0.7"""
+        """TODO adjust to handle multiple images"""
+        pre_processed_input_image = pre_process_image_for_vgg(image_224_224,self.backbone_classifier_input_shape)
+        feature_map = self.backbone_classifier.predict(pre_processed_input_image)
 
-        intersect_width_matrix = K.maximum(0.0,bottom_right_x_intersect_matrix-top_left_x_intersect_matrix)
-        intersect_height_matrix = K.maximum(0.0,bottom_right_y_intersect_matrix-top_left_y_intersect_matrix)
+        feature_to_input, input_to_feature = get_conversions_between_input_and_feature(pre_processed_input_image.shape,feature_map.shape)
+        anchor_boxes_input_coordinates_2d = get_input_coordinates_of_anchor_points(feature_map.shape,feature_to_input)
 
-        intersection_area = intersect_width_matrix * intersect_height_matrix
+        predicted_output = self.model.predict(feature_map)
+        [classification, parm_deltas] = [0,1]
+        
 
-        # Target boxes area
-        target_boxes_top_left_x = target_boxes[...,0]
-        target_boxes_bottom_right_x = target_boxes[...,2]
-        target_boxes_width = target_boxes_bottom_right_x - target_boxes_top_left_x
+        anchor_boxes_indicies_above_threshhold = np.argwhere(predicted_output[classification] > objectiveness_threshold)
+        if len(anchor_boxes_indicies_above_threshhold) == 0:
+            return []
+        
+        list_of_bboxes = []
+        for a_box_index in anchor_boxes_indicies_above_threshhold:
+            [img_idx, height_idx, width_idx, channel_idx] = [a_box_index[0], a_box_index[1], a_box_index[2], a_box_index[3]]
 
-        target_boxes_top_left_y = target_boxes[...,1]
-        target_boxes_bottom_right_y = target_boxes[...,3]
-        target_boxes_height = target_boxes_bottom_right_y - target_boxes_top_left_y
+            selected_anchor_box = anchor_boxes_input_coordinates_2d[height_idx][width_idx]
+            parm_bbox_refinement = predicted_output[parm_deltas][0][height_idx][width_idx]
+            [t_x , t_y , t_w , t_h] = [0,1,2,3]
 
-        target_boxes_area = target_boxes_width * target_boxes_height
+            delta_x_c = inverse_parameterize_x_or_y_centre(parm_bbox_refinement[t_x], selected_anchor_box["xywh"]["x_c"], selected_anchor_box["xywh"]["w"])
+            delta_y_c = inverse_parameterize_x_or_y_centre(parm_bbox_refinement[t_y], selected_anchor_box["xywh"]["y_c"], selected_anchor_box["xywh"]["h"])
+            delta_width = inverse_parameterize_width_or_height(parm_bbox_refinement[t_w], selected_anchor_box["xywh"]["w"])
+            delta_height = inverse_parameterize_width_or_height(parm_bbox_refinement[t_h], selected_anchor_box["xywh"]["h"])
 
-        # predicted boxes area
-        predicted_boxes_top_left_x = predicted_boxes[...,0]
-        predicted_boxes_bottom_right_x = predicted_boxes[...,2]
-        predicted_boxes_width = predicted_boxes_bottom_right_x - predicted_boxes_top_left_x
+            pred_bbox = {
+                "xywh" : {
+                    "x_c" : round(selected_anchor_box["xywh"]["x_c"] + delta_x_c)
+                    ,"y_c" : round(selected_anchor_box["xywh"]["y_c"] + delta_y_c)
+                    ,"w" : round(selected_anchor_box["xywh"]["w"] + delta_width)
+                    ,"h" : round(selected_anchor_box["xywh"]["h"] + delta_height)
+                }
+                ,"p1p2" : {
+                    "x1" : round(selected_anchor_box["xywh"]["x_c"] + delta_x_c - (selected_anchor_box["xywh"]["w"] + delta_width)/2)
+                    ,"y1" : round(selected_anchor_box["xywh"]["y_c"] + delta_y_c - (selected_anchor_box["xywh"]["h"] + delta_height)/2)
+                    ,"x2" : round(selected_anchor_box["xywh"]["x_c"] + delta_x_c + (selected_anchor_box["xywh"]["w"] + delta_width)/2)
+                    ,"y2" : round(selected_anchor_box["xywh"]["y_c"] + delta_y_c + (selected_anchor_box["xywh"]["h"] + delta_height)/2)
+                }
+            }
 
-        predicted_boxes_top_left_y = predicted_boxes[...,1]
-        predicted_boxes_bottom_right_y = predicted_boxes[...,3]
-        predicted_boxes_height = predicted_boxes_bottom_right_y - predicted_boxes_top_left_y
+            objectiveness_prob = predicted_output[classification][0][height_idx][width_idx][channel_idx]
 
-        predicted_boxes_area = predicted_boxes_width * predicted_boxes_height
-
-        # Calculate IOU (intersection over union)
-        intersection_over_union = intersection_area / (target_boxes_area + predicted_boxes_area - intersection_area)
-
-        return intersection_over_union
-
-    @staticmethod # can be called without initialising object
-    def custom_loss(y_ground_truth, y_predicted):
-        """Calculates custom loss function to solve regression component of RPN (Region Proposal Network)"""
-        mean_squared_error = losses.mean_squared_error(y_ground_truth, y_predicted)
-        intersection_over_union = generate_custom_model.calculate_iou(y_ground_truth, y_predicted)
-        custom_loss_values = mean_squared_error + (1 - intersection_over_union)
-        return custom_loss_values
-
+            list_of_bboxes.append({
+                "Probability" : objectiveness_prob
+                ,"BoundingBox" : pred_bbox
+            })
+        return list_of_bboxes
+   
 """ -------------------------------------------------------- UTILITY FUNCTIONS ----------------------------------------------------------- """
-    
+def parameterize_x_or_y_centre(ground_truth_x_or_y_centre, anchor_box_x_or_y_centre, anchor_box_w_or_h):
+    """Parameterizes the delata box centre coordinate changes using t_x=(gt_x_c-abox_x_c)/abox_w and t_y=(gt_y_c-abox_y_c)/abox_h"""
+    return (ground_truth_x_or_y_centre - anchor_box_x_or_y_centre)/anchor_box_w_or_h
+
+def parameterize_width_or_height(ground_truth_w_or_h, anchor_box_w_or_h):
+    """Parameterizes the delata box centre coordinate changes using t_w=log(gt_w/abox_w) and t_h=log(gt_w/abox_w)"""
+    """Note 1: Ensure you do not have any ground truth boxes with a width or height of 0 otherwise it will break the parameterisation"""
+    return math.log(ground_truth_w_or_h/anchor_box_w_or_h)
+
+def inverse_parameterize_x_or_y_centre(parameter_t_x_or_y_centre, anchor_box_x_or_y_centre, anchor_box_w_or_h):
+    """Inverse of x or y centre parameterisation aka ground_truth_x_centre=t_x*abox_w+abox_x_centre"""
+    return parameter_t_x_or_y_centre*anchor_box_w_or_h + anchor_box_x_or_y_centre
+
+def inverse_parameterize_width_or_height(parameter_t_w_or_h, anchor_box_w_or_h):
+    """Inverse of width or height parameterisation aka ground_truth_width="""
+    """Note 1: Ensure you do not have any ground truth boxes with a width or height of 0 otherwise it will break the parameterisation"""
+    return math.exp(parameter_t_w_or_h) * anchor_box_w_or_h
+
 def pre_process_image_for_vgg(img,input_size):
     """
         Resizes the image to input of VGGInputSize specified in the config dictionary
@@ -362,10 +395,8 @@ def get_conversions_between_input_and_feature(pre_processed_input_image_shape,fe
     return feature_to_input, input_to_feature
 
 def get_input_coordinates_of_anchor_points(feature_map_shape,feature_to_input):
-    """
-        Maps the CNN output (Feature map) coordinates on the pre-processed input image space to the backbone CNN 
-        Returns the coordinates as a 2d of dictionaries with the format {"x":x,"y":y}
-    """
+    """Maps the CNN output (Feature map) coordinates on the pre-processed input image space to the backbone CNN"""
+    """Returns the coordinates as a 2d of dictionaries with the format {"x":x,"y":y}"""
     assert len(feature_map_shape) in [3,4] # Either a 4d array with [:,height,width,channels] or just a single feature map [height,width,channels]
 
     if len(feature_map_shape) == 3:
@@ -419,41 +450,6 @@ def get_iou_from_bboxes(bbox_1,bbox_2):
     iou = intersection_area / float(bbox_1_area + bbox_2_area - intersection_area)
     return iou
 
-def iou_loss(y_true, y_pred):
-    """IOU loss function for """
-    # iou loss for bounding box prediction
-    # input must be as [x1, y1, x2, y2]
-    
-    # AOG = Area of Groundtruth box
-    AoG = K.abs(K.transpose(y_true)[2] - K.transpose(y_true)[0] + 1) * K.abs(K.transpose(y_true)[3] - K.transpose(y_true)[1] + 1)
-    
-    # AOP = Area of Predicted box
-    AoP = K.abs(K.transpose(y_pred)[2] - K.transpose(y_pred)[0] + 1) * K.abs(K.transpose(y_pred)[3] - K.transpose(y_pred)[1] + 1)
-
-    # overlaps are the co-ordinates of intersection box
-    overlap_0 = K.maximum(K.transpose(y_true)[0], K.transpose(y_pred)[0])
-    overlap_1 = K.maximum(K.transpose(y_true)[1], K.transpose(y_pred)[1])
-    overlap_2 = K.minimum(K.transpose(y_true)[2], K.transpose(y_pred)[2])
-    overlap_3 = K.minimum(K.transpose(y_true)[3], K.transpose(y_pred)[3])
-
-    # intersection area
-    intersection = (overlap_2 - overlap_0 + 1) * (overlap_3 - overlap_1 + 1)
-
-    # area of union of both boxes
-    union = AoG + AoP - intersection
-    
-    # iou calculation
-    iou = intersection / union
-
-    # bounding values of iou to (0,1)
-    iou = K.clip(iou, 0.0 + K.epsilon(), 1.0 - K.epsilon())
-
-    # loss for the iou value
-    iou_loss = -K.log(iou)
-
-    return iou_loss
-
-
 """ -------------------------------------------------------- CONFIG ----------------------------------------------------------- """
 config = {
     "Dataset" : 
@@ -461,7 +457,7 @@ config = {
         "ImageWidth" : 224
         ,"ImageHeight" : 224
         ,"ImageChannels" : 3
-        ,"DatasetSize" : 50
+        ,"DatasetSize" : 100
     }
     ,"Model" : {
         "ModelInputSize" : (224,224)
@@ -486,6 +482,25 @@ if __name__ == "__main__":
 
     # Split dataset & train model
     x_data, y_data = dataset.get_machine_formatted_dataset()
-    history = custom_model.model.fit(x=x_data,y=y_data, batch_size=8, shuffle=True, epochs=4, verbose=1,validation_split=0.1)
+    history = custom_model.model.fit(x=x_data,y=y_data, batch_size=8, shuffle=True, epochs=16, verbose=1,validation_split=0.1)
 
-    predicted_output = custom_model.model.predict(dataset.dataset[0]["ModelCompatible"]["Input"])
+    # Show Image and predictions from RPN
+    for img_sel, row in enumerate(dataset.dataset):
+
+        img = row["HumanReadable"]["Image"].copy()
+        pred_bboxes = custom_model.predict_object(img,objectiveness_threshold=0.4)
+
+        print(f'[img={img_sel}] Ground Truth = {dataset.dataset[img_sel]["HumanReadable"]["GroundTruthBox"]["p1p2"]}')
+        for pred_bbox in pred_bboxes:
+            print(f'[img={img_sel}]Predicted [{round(pred_bbox["Probability"]*100,4)}%] = {pred_bbox["BoundingBox"]["p1p2"]}')
+            img = cv2.rectangle(
+                img
+                ,(pred_bbox["BoundingBox"]["p1p2"]["x1"],pred_bbox["BoundingBox"]["p1p2"]["y1"])
+                ,(pred_bbox["BoundingBox"]["p1p2"]["x2"],pred_bbox["BoundingBox"]["p1p2"]["y2"])
+                ,(255,255,255)
+                ,3
+            )
+
+        cv2.imshow("Prediction Image",img)
+        cv2.waitKey(100)
+    print('finishing')
