@@ -15,18 +15,16 @@ Please note: This implementation will not use scale and aspect ratio so there wi
 - RPN Regression Output (:,7,7,4) in the form [x delta,y delta,width delta,height delta]
 
 # Overall Question #
-1) **How do I make the regression component of RPN work?** I have the classification component working here https://github.com/alexshellabear/Still-Simple-Region-Proposal-Network
-
-### Sub Questions ###
-1) Is the RPN regression output in the input image coordinate space (i.e 224 pixels by 224 pixels)? An example of one the deltas may be ```[100.0 (move box 100 left),10.0 (move box 10 up),-100.0 (reduce box width by 100 pixels),-20.0 (reduce box height by 20 pixels)]```
-2) What is the loss function for regression component of RPN?
+1) **How do I make the regression component of RPN work?** I have the classification component working
+- https://github.com/alexshellabear/Still-Simple-Region-Proposal-Network
 
 ## Explanation of Highest Level Code ##
-This is comprised of 4 steps
-1) generate human readable dataset
+This is comprised of 5 steps
+1) Generate human readable dataset
 2) Compile model
-3) generate model compatible dataset
-4) split data & train
+3) Generate model compatible dataset
+4) Split data & train
+5) Predict & show predictions
 
 ```Python
 config = {
@@ -35,7 +33,7 @@ config = {
         "ImageWidth" : 224
         ,"ImageHeight" : 224
         ,"ImageChannels" : 3
-        ,"DatasetSize" : 50
+        ,"DatasetSize" : 100
     }
     ,"Model" : {
         "ModelInputSize" : (224,224)
@@ -60,7 +58,29 @@ if __name__ == "__main__":
 
     # Split dataset & train model
     x_data, y_data = dataset.get_machine_formatted_dataset()
-    history = custom_model.model.fit(x=x_data,y=y_data, batch_size=8, shuffle=True, epochs=4, verbose=1,validation_split=0.1)
+    history = custom_model.model.fit(x=x_data,y=y_data, batch_size=8, shuffle=True, epochs=16, verbose=1,validation_split=0.1)
+
+    # Show Image and predictions from RPN
+    for img_sel, row in enumerate(dataset.dataset):
+
+        img = row["HumanReadable"]["Image"].copy()
+        pred_bboxes = custom_model.predict_object(img,objectiveness_threshold=0.4)
+
+        print(f'[img={img_sel}] Ground Truth = {dataset.dataset[img_sel]["HumanReadable"]["GroundTruthBox"]["p1p2"]}')
+        for pred_bbox in pred_bboxes:
+            print(f'[img={img_sel}]Predicted [{round(pred_bbox["Probability"]*100,4)}%] = {pred_bbox["BoundingBox"]["p1p2"]}')
+            img = cv2.rectangle(
+                img
+                ,(pred_bbox["BoundingBox"]["p1p2"]["x1"],pred_bbox["BoundingBox"]["p1p2"]["y1"])
+                ,(pred_bbox["BoundingBox"]["p1p2"]["x2"],pred_bbox["BoundingBox"]["p1p2"]["y2"])
+                ,(255,255,255)
+                ,3
+            )
+
+        cv2.imshow("Prediction Image",img)
+        cv2.waitKey(250)
+    print('finishing')
 ```
 
 ## Explanation of Dataset Generation ##
+1 random box per image is drawn onto a black image of 224x224 pixels. 
