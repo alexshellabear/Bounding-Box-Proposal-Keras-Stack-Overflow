@@ -502,5 +502,5 @@ if __name__ == "__main__":
             )
 
         cv2.imshow("Prediction Image",img)
-        cv2.waitKey(100)
+        cv2.waitKey(250)
     print('finishing')
